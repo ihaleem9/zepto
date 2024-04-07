@@ -1,0 +1,107 @@
+From trying to understand the ER diagram, some of the cardinality of relationships seem to be inaccurate. Here are my findings:
+
+1) Relationship between debits & bank_accounts seem to be flipped. It should be 'many to 1' as multiple debit transactions could be associated to a single bank account.
+2) Relationship between bank_accounts & credits is seem to be flipped. It should be '1 to many' as multiple credit transactions could be associated to a single bank account.
+
+Above two are based on the assumption that we do not allow credit or debit transactions to split between multiple bank accounts - there has to be a single bank account for deposit or credit.
+
+
+The ER Diagram schema represents the schema of an OLTP system designed to run operations. My proposed approach is to build an OLAP system or data warehouse following Kimball's method of dimensional modeling whereby I build a snowflake schema that would be efficient for querying and analytical purposes. There are other benefits such as storing the historical data in OLAP and keep the OLTP free from history data if it isn't needed for operational purposes. On top of the star schema, I recommend we create aggregated views to serve as a source for dashboards. These views will have pre-calculated summary metrics making it easier for users to access and analyze data directly.
+
+We will design a transactional data model that will include a fact table capturing transactions, a factless fact table capturing the relationship between product & merchant and a bunch of dimension tables related to it - SEE ATTACHED.
+
+
+Assumptions taken into consideration:
+1. Products are unique to merchants (same product cannot be used by multiple merchants) thus a factless fact table is present in the model.
+2. "Customers" referred by Commercial team refers to Merchants.
+3. When a customer makes a debit transaction, the record is stored in the transactions fact table. In case of returns, we will insert another record that will have a negative amount. Also, the field merchant_credit_status & its timestamp would be updated usually by a MERGE sql statement that inserts new records and updates these fields if already existing. Otherwise if reporting frequency is going to be intraday then a separate update statement will be run that only runs on trigger at the source side.
+
+
+Here are the queries used to address the below requirements:
+
+with agg_view as (
+select 
+datetrunc('month', tf.transaction_date) as transaction_month
+, pd.product_name
+, md.merchant_name
+, sum(case when tf.transaction_amount > 0 then tf.transaction_amount end) as revenue
+, sum(case when tf.transaction_amount < 0 then tf.transaction_amount end) as refund_amount
+, sum(case when tf.merchant_credit_status <> 'RECEIVED' and tf.transaction_amount > 0 then tf.transaction_amount end) as unreconciled_amount
+, sum(case when tf.transaction_amount > 0 then 1 end) as transactions_count
+, sum(case when tf.transaction_amount < 0 then 1 end) as refund_transactions_count
+from transaction_fact tf
+join merchant_products_ff mpf on mpf.product_merchant_sk = tf.product_merchant_sk
+join merchant_dim md on md.merchant_id = mpf.merchant_id
+join products_dim pd on pd.product_id = mpf.product_id
+group by all
+)
+
+Finance
+Report on monthly revenue: We can build a dashboard that has the option to filter by dates and shows the total revenue but also has the option to slice by Merchant to see what is their contribution. The query to address the requirement is:
+
+select 
+transaction_month
+, sum(revenue) as revenue
+from agg_view
+group by all;
+
+Report on revenue per product: We can build a dashboard that has the option to filter by dates and merchants. The query to address the requirement is:
+
+select 
+product_name
+, merchant_name
+, sum(revenue) as revenue
+from agg_view
+group by all;
+
+
+Reconciliation of books: The below shows unreconciled amounts that has not been received from the customer to the merchant, broken down by historical months.
+
+select 
+transaction_month
+, sum(unreconciled_amount) as unreconciled_amount
+from agg_view
+group by all;
+
+Commercial
+Identify customers which are growing/underperforming: We can build a line chart that shows monthly trends of each merchant which could depict period over period (YOY or MOM) % change in terms of transaction counts. 
+
+select 
+transaction_month
+, merchant_name
+, sum(transaction_count) as transaction_count
+from agg_view
+group by all;
+
+Which products are performing best: We can built a report that shows top products by transaction_counts (or even transaction_amounts) for a specific period.
+
+select
+transaction_month
+, product_name
+, merchant_name --always to pull in merchant with product assuming they have a 1-1 relationship to merchants
+, sum(transaction_count) as transaction_count
+from agg_view
+group by all;
+
+Operations
+Identify merchants with a high fraud/refund rate: We can build a report that shows top merchants with refund rates sorted in a descending order for a specific time period.
+
+select 
+merchant_name
+, sum(refund_transactions_count)/sum(transactions_count) as refund_rate
+from agg_view
+group by all
+order by 2 desc;
+
+
+Identify potential fraudulent bank accounts: We have to directly query the Transaction Model as specific bank account details are not stored in aggregated view. Also, will need requirement from the business how to identify "Fraud" - whether the source system flags those transactions (in which case we can pull that flag into our model) or if there is any analytical definition of fraud. Since we dont have that understanding, for now I'm assuming that high number of refunds account for fraud.
+  
+select 
+cd.customer_bank_account
+, sum(refund_transactions_count) as refund_transactions_count
+from transaction_fact tf
+join customer_dim cd on cd.customer_id = tf.customer_id
+group by all
+order by 2 desc
+limit 5;
+
